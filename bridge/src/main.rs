@@ -3,6 +3,7 @@ use futures_util::future::try_join_all;
 use kaspa_alloc::init_allocator_with_default_settings;
 use kaspa_stratum_bridge::log_colors::LogColors;
 use kaspa_stratum_bridge::{KaspaApi, StratumServerBridgeConfig as StratumBridgeConfig, listen_and_serve_with_shutdown, prom};
+#[cfg(not(windows))]
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
@@ -16,11 +17,13 @@ use tracing_subscriber::EnvFilter;
 #[cfg(windows)]
 use windows_sys::Win32::System::Console::{CTRL_C_EVENT, SetConsoleCtrlHandler};
 
+#[cfg(not(windows))]
 use kaspad_lib::args as kaspad_args;
 
 mod app_dirs;
 mod cli;
 mod health_check;
+#[cfg(not(windows))]
 mod inprocess_node;
 mod tracing_setup;
 
@@ -28,6 +31,7 @@ mod tracing_setup;
 mod tests;
 
 use cli::{Cli, NodeMode, apply_cli_overrides};
+#[cfg(not(windows))]
 use inprocess_node::InProcessNode;
 use kaspa_stratum_bridge::BridgeConfig;
 
@@ -86,6 +90,7 @@ fn install_windows_ctrl_handler(shutdown_tx: watch::Sender<bool>) -> Result<(), 
     Ok(())
 }
 
+#[cfg(not(windows))]
 async fn shutdown_inprocess_with_timeout(node: InProcessNode) {
     let timeout = std::time::Duration::from_secs(10);
     match tokio::time::timeout(timeout, inprocess_node::shutdown_inprocess(node)).await {
@@ -146,6 +151,46 @@ fn initialize_config() -> BridgeConfig {
     config.unwrap_or_default()
 }
 
+fn effective_node_mode(cli_mode: Option<NodeMode>) -> Result<NodeMode, anyhow::Error> {
+    #[cfg(not(windows))]
+    {
+        Ok(cli_mode.unwrap_or(NodeMode::Inprocess))
+    }
+
+    #[cfg(windows)]
+    {
+        match cli_mode.unwrap_or(NodeMode::External) {
+            NodeMode::External => Ok(NodeMode::External),
+            NodeMode::Inprocess => Err(anyhow::anyhow!(
+                "node-mode=inprocess is not supported on Windows in this build; use --node-mode external"
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod node_mode_tests {
+    use super::{NodeMode, effective_node_mode};
+
+    #[cfg(not(windows))]
+    #[test]
+    fn defaults_to_inprocess_on_non_windows() {
+        assert_eq!(effective_node_mode(None).unwrap(), NodeMode::Inprocess);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn defaults_to_external_on_windows() {
+        assert_eq!(effective_node_mode(None).unwrap(), NodeMode::External);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_inprocess_mode_on_windows() {
+        assert!(effective_node_mode(Some(NodeMode::Inprocess)).is_err());
+    }
+}
+
 /// Log the bridge configuration at startup
 fn log_bridge_configuration(config: &BridgeConfig) {
     let instance_count = config.instances.len();
@@ -189,7 +234,7 @@ async fn main() -> Result<(), anyhow::Error> {
         tracing::warn!("Failed to set requested config path - may already be initialized");
     }
 
-    let node_mode = cli.node_mode.unwrap_or(NodeMode::Inprocess);
+    let node_mode = effective_node_mode(cli.node_mode)?;
 
     let mut config = initialize_config();
     apply_cli_overrides(&mut config, &cli)?;
@@ -230,7 +275,9 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Start in-process node after tracing is initialized so bridge logs (including the stats table)
     // are not filtered out by a tracing subscriber installed by kaspad.
+    #[cfg(not(windows))]
     let mut inprocess_node: Option<InProcessNode> = None;
+    #[cfg(not(windows))]
     if node_mode == NodeMode::Inprocess {
         let mut node_args: Vec<String> = cli.kaspad_args;
 
@@ -488,6 +535,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     tokio::select! {
         res = &mut bridge_fut => {
+            #[cfg(not(windows))]
             if let Some(node) = inprocess_node {
                 shutdown_inprocess_with_timeout(node).await;
             }
@@ -511,6 +559,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     }
                 };
 
+                #[cfg(not(windows))]
                 if let Some(node) = inprocess_node {
                     shutdown_inprocess_with_timeout(node).await;
                 }
@@ -531,6 +580,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     }
                 };
 
+                #[cfg(not(windows))]
                 if let Some(node) = inprocess_node {
                     shutdown_inprocess_with_timeout(node).await;
                 }

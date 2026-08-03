@@ -44,7 +44,6 @@ kaspa-notify = { workspace = true }
 kaspa-core = { workspace = true }
 kaspa-utils = { workspace = true }
 kaspa-alloc = { workspace = true }
-kaspad = { workspace = true }
 dirs = { workspace = true }
 
 # External dependencies - using workspace versions where available
@@ -97,6 +96,9 @@ chrono = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Console"] }
+
+[target.'cfg(not(windows))'.dependencies]
+kaspad = { workspace = true }
 
 # musl (dist) builds: declare mimalloc without 'override' so it overrides
 # kaspa-alloc's version; the .cargo linker flag handles remaining conflicts
