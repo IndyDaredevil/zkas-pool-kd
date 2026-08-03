@@ -1,0 +1,230 @@
+# Windows build for the zkas-pool stratum bridge (merged-mining capable).
+#
+# Install in your fork of firecash/zkas-pool at:
+#   .github/workflows/build-windows-bridge.yml
+#
+# Triggers:
+#   1. Actions tab -> "Build Windows bridge" -> "Run workflow"  (zip appears
+#      under the run's Artifacts)
+#   2. Publishing a release on your fork (zip is attached to the release)
+#
+# Honest caveat: this workspace has only ever been CI'd on Linux (musl).
+# The vendored bridge core comes from rusty-kaspa, which does build on
+# Windows/MSVC, so this is expected to work -- but it is a first-time
+# platform for this repo. The cheap Linux `cargo check` below runs first
+# and gates the Windows job, so a broken dependency graph fails in
+# minutes instead of wasting a long Windows build.
+#
+# Dependency pinning: the kaspa-* deps are [patch]-ed to
+# firecash/zkas-rusty branch=main, and Cargo.lock pins them to exact
+# commits. Upstream pushes to that branch change nothing here until the
+# lockfile is regenerated -- builds are reproducible, and the cargo cache
+# (keyed on Cargo.lock) stays valid across runs.
+#
+# ============================================================================
+# RUNTIME CONFIG -- READ THIS, IT IS EASY TO GET WRONG
+#
+# Real dual-chain merged mining is controlled by ENVIRONMENT VARIABLES ONLY.
+# The `merged_kaspa_address` / `merged_kaspa_pay_address` fields that appear
+# in the yaml config structs exist but are NEVER READ by the code (verified
+# against bridge/src/kaspaapi.rs). Required env vars:
+#
+#   ZKAS_MERGED_MINING=1                    master switch (else native-only)
+#   ZKAS_KASPA_NODE=127.0.0.1:16110         upstream Kaspa node gRPC
+#   ZKAS_KASPA_PAY=kaspa:<your address>     KAS coinbase recipient
+#
+# Success is TWO log lines at startup:
+#   "Merged-mining (AuxPoW) mode ENABLED"
+#   "Real merged mining ENABLED: parent from Kaspa node ..."
+# If instead you see "running ZKas-aux-only" (logged at info, easy to miss),
+# the bridge is running but earning ZERO KAS. The zip packaged below ships a
+# MERGED-MINING-SETUP.txt and a run-merged-example.cmd restating all of this
+# next to the exe.
+# ============================================================================
+
+name: Build Windows bridge
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+# Default: no permissions. Each job requests only what it needs; the
+# release-attach step is isolated in its own job so `contents: write` is
+# never granted to build steps or to manual runs that don't touch releases.
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Fast fail-first gate: validates that the whole dependency graph (git
+  # patches, lockfile, feature resolution) compiles at check-level. ~10 min
+  # on Linux vs burning an hour discovering the same failure on Windows.
+  # Catches graph/lockfile problems only -- NOT Windows-specific code issues.
+  preflight:
+    name: preflight cargo check (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: preflight-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: cargo check bridge crate
+        run: cargo check -p kaspa-stratum-bridge --bin stratum-bridge --release
+
+  build-windows:
+    name: stratum-bridge (windows x86_64, MSVC)
+    needs: preflight
+    runs-on: windows-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - name: Avoid CRLF checkout issues
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: windows-bridge-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # +crt-static: no VCRedist dependency, runs on any 64-bit Win 10/11.
+      # Set via env because this repo has no .cargo/config.toml; on a Windows
+      # host building the host target this is equivalent to zkas-rusty's
+      # [target.x86_64-pc-windows-msvc] config entry. RUSTFLAGS is identical
+      # on every run, so it does not churn the cache. The upstream release
+      # workflow's `-D warnings` is deliberately NOT used: Windows-only
+      # warnings in vendored code should not fail a first-platform build.
+      - name: Build stratum-bridge (release, static CRT)
+        shell: bash
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: cargo build --release -p kaspa-stratum-bridge --bin stratum-bridge
+
+      - name: Package zip
+        shell: bash
+        run: |
+          ver="${{ github.event.release.tag_name }}"
+          [ -z "$ver" ] && ver="${GITHUB_SHA::8}"
+          pkg="zkas-stratum-bridge-${ver}-win64"
+          mkdir "$pkg"
+          cp target/release/stratum-bridge.exe "$pkg/"
+
+          # Sample configs for stratum ports / vardiff / dashboard settings.
+          # NOTE: yaml cannot enable dual-chain merged mining (see below).
+          cp zkas-bridge.yaml "$pkg/" || true
+          cp bridge/config.yaml "$pkg/config.sample.yaml" || true
+          cp bridge/docs/README.md "$pkg/BRIDGE-README.md" || true
+          cp help.txt "$pkg/" || true
+
+          # Ship the config truth next to the binary.
+          cat > "$pkg/MERGED-MINING-SETUP.txt" <<'EOF'
+          ZKas stratum bridge -- merged mining (KAS + zKAS) setup
+          =======================================================
+
+          Dual-chain merged mining is controlled by ENVIRONMENT VARIABLES.
+          The merged_kaspa_* fields in the yaml files are not read by the
+          code -- setting them does nothing. Required:
+
+            set ZKAS_MERGED_MINING=1
+            set ZKAS_KASPA_NODE=127.0.0.1:16110
+            set ZKAS_KASPA_PAY=kaspa:<your-kaspa-address>
+
+          The yaml file still matters for everything else. In particular:
+            kaspad_address: "127.0.0.1:16810"   <-- your ZKAS node, not
+                                                    Kaspa's 16110
+            stratum_port entries                <-- must not collide with
+                                                    any bridge already
+                                                    running on this machine
+
+          Startup log MUST show BOTH lines or you are earning no KAS:
+            "Merged-mining (AuxPoW) mode ENABLED"
+            "Real merged mining ENABLED: parent from Kaspa node ..."
+          If you see "running ZKas-aux-only" instead, an env var is
+          missing/typo'd or the Kaspa node was unreachable at startup.
+
+          Operations on Windows:
+            - First launch will trigger a Windows Firewall prompt; allow it,
+              or ASICs on your LAN cannot reach the stratum port.
+            - For 24/7 mining, run the bridge as a service (NSSM or Task
+              Scheduler "At startup", with the env vars set in the service
+              definition) so it survives logout and reboots.
+            - Validate with partial hashrate first, and confirm a found
+              Kaspa block actually pays ZKAS_KASPA_PAY before cutting over
+              all rigs.
+          EOF
+
+          # Convenience launcher showing the env vars in action.
+          cat > "$pkg/run-merged-example.cmd" <<'EOF'
+          @echo off
+          rem EDIT THESE before use, then run from this folder.
+          set ZKAS_MERGED_MINING=1
+          set ZKAS_KASPA_NODE=127.0.0.1:16110
+          set ZKAS_KASPA_PAY=kaspa:REPLACE_WITH_YOUR_ADDRESS
+          stratum-bridge.exe --config zkas-bridge.yaml
+          EOF
+
+          powershell Compress-Archive -Path "$pkg" -DestinationPath "${pkg}.zip"
+          echo "PKG=${pkg}" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PKG }}
+          path: ${{ env.PKG }}.zip
+
+  # Separate job so `contents: write` is granted only here, and only runs
+  # for the release trigger.
+  attach-to-release:
+    name: attach zip to release
+    if: github.event_name == 'release'
+    needs: build-windows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "**/*.zip"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
